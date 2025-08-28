@@ -47,6 +47,20 @@ you can install a CPU-only `pytorch` by following the `pytorch` [installation gu
 $ pip install torch --index-url https://download.pytorch.org/whl/cpu
 ```
 
+## Initialization
+
+After installation, you can import and initialize the main class:
+
+```python
+from dca.dca import DynamicalComponentsAnalysis as DCA
+
+# Example
+import numpy as np
+X = np.random.randn(1000, 20) # data matrix, shape=(time_steps, N)
+dca_model = DCA(T=5, d=10)
+dca_model.estimate_data_statistics(X)
+dca_model.fit_projection()
+```
 
 ## Datasets
 The 4 datasets used in the DCA paper can be found in the following locations
