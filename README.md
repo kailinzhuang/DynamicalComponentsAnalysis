@@ -9,6 +9,13 @@ Implementation of the methods and analyses in [Unsupervised Discovery of Tempora
 Documentation can be found at https://dynamicalcomponentsanalysis.readthedocs.io/en/latest/index.html
 
 ## Installation
+
+### Install release from PyPI
+```bash
+pip install DynamicalComponentsAnalysis
+```
+
+### Install from source
 To install, you can clone the repository and `cd` into the DynamicalComponentsAnalysis folder.
 
 ```bash
