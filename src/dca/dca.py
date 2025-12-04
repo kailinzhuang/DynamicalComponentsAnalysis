@@ -309,7 +309,7 @@ class DynamicalComponentsAnalysis(SingleProjectionComponentsAnalysis):
         V_opt = scipy.linalg.orth(v)
         final_pi = calc_pi_from_cross_cov_mats(c, V_opt).detach().cpu().numpy()
         if use_ib_loss:
-            mi_xp_vxp = sdca_calc_pi(sxu_cross_covs, V=np.eye(N), W=V_opt, N=N, M=d)
+            mi_xp_vxp = sdca_calc_pi_from_cross_cov_mats(sxu_cross_covs, V=np.eye(N), W=V_opt, N=N, M=d)
         else:
             mi_xp_vxp = None
         return V_opt, final_pi, mi_xp_vxp
