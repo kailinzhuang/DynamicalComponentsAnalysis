@@ -9,7 +9,7 @@ import torch.fft
 import torch.nn.functional as F
 
 from .base import SingleProjectionComponentsAnalysis, ortho_reg_fn, init_coef, ObjectiveWrapper
-from .cov_util import (calc_cross_cov_mats_from_data, calc_pi_from_cross_cov_mats,
+from .cov_util import (calc_cross_cov_mats_from_data, calc_pi_from_cross_cov_mats,calc_cov_from_cross_cov_mats,
                        calc_pi_from_cross_cov_mats_block_toeplitz)
 
 __all__ = ['DynamicalComponentsAnalysis',
@@ -54,6 +54,23 @@ def build_loss(cross_cov_mats, d, ortho_lambda=1., block_toeplitz=False):
             V = V_flat.reshape(N, d)
             reg_val = ortho_reg_fn(ortho_lambda, V)
             return -calc_pi_from_cross_cov_mats(cross_cov_mats, V) + reg_val
+
+    return loss
+
+
+def build_ib_loss(cross_cov_mats, d, ortho_lambda=1., beta=0.5):
+    N = cross_cov_mats.shape[1]
+    def loss(V_flat, sxu_cross_covs):
+            V = V_flat.reshape(N, d)
+            reg_val = ortho_reg_fn(ortho_lambda, V)
+            pi = calc_pi_from_cross_cov_mats(cross_cov_mats, V)
+            mi_xp_vxp = sdca_calc_pi_from_cross_cov_mats(
+                sxu_cross_covs,
+                V=np.eye(N),
+                W=V,
+                N=N,
+                M=d)
+            return -pi + reg_val + beta * mi_xp_vxp
 
     return loss
 
@@ -128,12 +145,15 @@ class DynamicalComponentsAnalysis(SingleProjectionComponentsAnalysis):
     def __init__(self, d=None, T=None, init="random_ortho", n_init=1, stride=1,
                  chunk_cov_estimate=None, tol=1e-6, ortho_lambda=10., verbose=False,
                  block_toeplitz=None, method='toeplitzify', device="cpu", dtype=torch.float64,
-                 rng_or_seed=None):
+                 rng_or_seed=None,
+                 ib_loss=False,
+                 ib_beta=None):
 
         super(DynamicalComponentsAnalysis,
               self).__init__(d=d, T=T, init=init, n_init=n_init, stride=stride,
                              chunk_cov_estimate=chunk_cov_estimate, tol=tol, verbose=verbose,
-                             device=device, dtype=dtype, rng_or_seed=rng_or_seed)
+                             device=device, dtype=dtype, rng_or_seed=rng_or_seed,
+                             ib_loss=ib_loss, ib_beta=ib_beta)
 
         self.ortho_lambda = ortho_lambda
         if block_toeplitz is None:
@@ -148,6 +168,10 @@ class DynamicalComponentsAnalysis(SingleProjectionComponentsAnalysis):
             self.block_toeplitz = block_toeplitz
         self.cross_covs = None
         self.method = method
+
+        if ib_loss:
+            if ib_beta is None:
+                raise ValueError("ib_beta need to be specified.")
 
     def estimate_data_statistics(self, X, T=None, regularization=None, reg_ops=None):
         """Estimate the cross covariance matrix from data.
@@ -186,6 +210,13 @@ class DynamicalComponentsAnalysis(SingleProjectionComponentsAnalysis):
         delta_time = round((time.time() - start) / 60., 1)
         self._logger.info('Cross covariance estimate took {:0.1f} minutes.'.format(delta_time))
 
+        if self.ib_loss:
+            sxu = np.concatenate((X[:-T], X[:-T]), axis=-1)
+            sxu_cross_covs = calc_cross_cov_mats_from_data(sxu, T=T)
+            self.sxu_cross_covs = sxu_cross_covs
+        else: 
+            self.sxu_cross_covs = None
+
         return self
 
     def _fit_projection(self, d=None, T=None, record_V=False):
@@ -215,6 +246,8 @@ class DynamicalComponentsAnalysis(SingleProjectionComponentsAnalysis):
             raise ValueError('T must less than or equal to the value when ' +
                              '`estimate_data_statistics()` was called.')
         self.T_fit = T
+        use_ib_loss = self.ib_loss
+        sxu_cross_covs = self.sxu_cross_covs
 
         if self.cross_covs is None:
             raise ValueError('Call `estimate_cross_covariance()` first.')
@@ -232,7 +265,10 @@ class DynamicalComponentsAnalysis(SingleProjectionComponentsAnalysis):
                                         device=self.device,
                                         dtype=self.dtype)
             v_torch = v_flat_torch.reshape(N, d)
-            loss = build_loss(c, d, self.ortho_lambda, self.block_toeplitz)(v_torch)
+            if use_ib_loss:
+                loss = build_ib_loss(c, d, self.ortho_lambda, self.ib_beta)(v_torch, sxu_cross_covs)
+            else:
+                loss = build_loss(c, d, self.ortho_lambda, self.block_toeplitz)(v_torch)
             return loss, v_flat_torch
         objective = ObjectiveWrapper(f_params)
 
@@ -272,7 +308,11 @@ class DynamicalComponentsAnalysis(SingleProjectionComponentsAnalysis):
         # Orthonormalize the basis prior to returning it
         V_opt = scipy.linalg.orth(v)
         final_pi = calc_pi_from_cross_cov_mats(c, V_opt).detach().cpu().numpy()
-        return V_opt, final_pi
+        if use_ib_loss:
+            mi_xp_vxp = sdca_calc_pi(sxu_cross_covs, V=np.eye(N), W=V_opt, N=N, M=d)
+        else:
+            mi_xp_vxp = None
+        return V_opt, final_pi, mi_xp_vxp
 
     def score(self, X=None):
         """Calculate the PI of data for the DCA projection.
@@ -334,6 +374,257 @@ def pi_fft(X, proj, T_pi):
     bs2 = make_cepts2(Xp_tensor, T_pi)
     ks = torch.arange(bs2.shape[-1], dtype=bs2.dtype)
     return .5 * (torch.unsqueeze(ks, 0) * bs2).sum(dim=1).sum()
+
+
+def project_cross_cov_mats(cross_cov_mats, V, W=None):
+    """Projects the cross covariance matrices.
+
+    Parameters
+    ----------
+    cross_cov_mats : np.ndarray, shape (T, N+M, N+M)
+        Cross-covariance matrices: cross_cov_mats[dt] is the
+        cross-covariance between XU(t) and XU(t+dt), where each
+        of XU(t) and XU(t+dt) is a (N+M)-dimensional vector.
+    V: np.ndarray, shape (N, d), optional
+        If provided, the N-dimensional data are projected onto a d-dimensional
+        basis given by the columns of V. Then, the mutual information is
+        computed for this d-dimensional timeseries.
+
+    Returns
+    -------
+    cross_cov_mats_proj : ndarray, shape (T, d, d)
+        Projected cross covariances matrices.
+    """
+    if isinstance(cross_cov_mats, torch.Tensor):
+        use_torch = True
+    elif isinstance(cross_cov_mats[0], torch.Tensor):
+        cross_cov_mats = torch.stack(cross_cov_mats)
+        use_torch = True
+    else:
+        use_torch = False
+        cross_cov_mats = np.stack(cross_cov_mats)
+    if W is None:
+        W = np.eye(cross_cov_mats.shape[1] - V.shape[0])
+    if use_torch and isinstance(V, np.ndarray):
+        V = torch.tensor(V, device=cross_cov_mats.device, dtype=cross_cov_mats.dtype)
+        W = torch.tensor(W, device=cross_cov_mats.device, dtype=cross_cov_mats.dtype)
+
+    return _project_cross_cov_mats(cross_cov_mats, V, use_torch, W=W)
+
+
+def _project_cross_cov_mats(cross_cov_mats, V, use_torch, W=None):
+    """
+    Parameters
+    ----------
+    cross_cov_mats : np.ndarray, shape (T, N+M, N+M)
+        Cross-covariance matrices: cross_cov_mats[dt] is the
+        cross-covariance between XU(t) and XU(t+dt), where each
+        of XU(t) and XU(t+dt) is a (N+M)-dimensional vector.
+    V: np.ndarray, shape (N, d)
+        The N-dimensional X data are projected onto a d-dimensional
+        basis given by the colums of V.
+
+    Returns
+    -------
+    cross_cov_mats_proj : ndarray, shape (T, d+M, d+M)
+        Projected cross covariance matrices for X.
+    """
+    if isinstance(cross_cov_mats, torch.Tensor):
+        use_torch = True
+    elif isinstance(cross_cov_mats[0], torch.Tensor):
+        cross_cov_mats = torch.stack(cross_cov_mats)
+        use_torch = True
+    else:
+        use_torch = False
+
+    if W is None:
+        W = np.eye(cross_cov_mats.shape[1] - V.shape[0])
+
+    if use_torch and isinstance(V, np.ndarray):
+        V = torch.tensor(V, device=cross_cov_mats.device, dtype=cross_cov_mats.dtype)
+        W = torch.tensor(W, device=cross_cov_mats.device, dtype=cross_cov_mats.dtype)
+    else:
+        if isinstance(V, torch.Tensor):
+            V = V.detach().cpu().numpy()
+        else:
+            V = np.array(V)
+        if isinstance(W, torch.Tensor):
+            W = W.detach().cpu().numpy()
+        else:
+            W = np.array(W)
+
+    N = V.shape[0]
+    T = cross_cov_mats.shape[0]
+    cross_cov_mats_proj = []
+    for i in range(T):
+        cross_cov = cross_cov_mats[i]
+        cc_x = cross_cov[:N, :N]  # N, N
+        cc_xu = cross_cov[:N, N:]  # N, M
+        cc_ux = cross_cov[N:, :N]  # M, N
+        cc_u = cross_cov[N:, N:]
+        if use_torch:
+            cc_x_proj = torch.matmul(V.T, torch.matmul(cc_x, V))
+            cc_xu_proj = torch.matmul(V.T, torch.matmul(cc_xu, W))
+            cc_ux_proj = torch.matmul(W.T, torch.matmul(cc_ux, V))
+            cc_u_proj = torch.matmul(W.T, torch.matmul(cc_u, W))
+            cc_top_proj = torch.cat((cc_x_proj, cc_xu_proj), dim=-1)
+            cc_bot_proj = torch.cat((cc_ux_proj, cc_u_proj), dim=-1)
+            cross_cov_proj = torch.cat((cc_top_proj, cc_bot_proj), dim=0)
+        else:
+            cc_x_proj = np.dot(V.T, np.dot(cc_x, V))  # D, D
+            cc_xu_proj = np.dot(V.T, np.dot(cc_xu, W))  # D, M
+            cc_ux_proj = np.dot(W.T, np.dot(cc_ux, V))  # M, D
+            cc_u_proj = np.dot(W.T, np.dot(cc_u, W))
+            cc_top_proj = np.concatenate((cc_x_proj, cc_xu_proj), axis=1)  # D, D+M
+            cc_bot_proj = np.concatenate((cc_ux_proj, cc_u_proj), axis=1)  # M, D+M
+            cross_cov_proj = np.concatenate(
+                (cc_top_proj, cc_bot_proj), axis=0
+            )  # D+M, D+M
+        cross_cov_mats_proj.append(cross_cov_proj)
+    if use_torch:
+        cross_cov_mats_proj = torch.stack(cross_cov_mats_proj)
+    else:
+        cross_cov_mats_proj = np.stack(cross_cov_mats_proj)
+    return cross_cov_mats_proj
+
+
+def sdca_calc_pi_from_cross_cov_mats(cross_cov_mats, V=None, W=None, N=None, M=None):
+    """Calculates predictive information for a spatiotemporal Gaussian
+    process with T-1 (N+M)-by-(N+M) cross-covariance matrices.
+
+    Parameters
+    ----------
+    cross_cov_mats : np.ndarray, shape (T, N+M, N+M)
+        Cross-covariance matrices: cross_cov_mats[dt] is the
+        cross-covariance between X(t) and X(t+dt), where each
+        of X(t) and X(t+dt) is a (N+M)-dimensional vector.
+    V: np.ndarray, shape (N, d), optional
+        If provided, the N-dimensional data are projected onto a d-dimensional
+        basis given by the columns of V. Then, the mutual information is
+        computed for this d-dimensional timeseries.
+    N : int
+        Dimension of neural data X or projected X.
+    M : int
+        Dimension of external data U.
+
+    Returns
+    -------
+    PI : float
+        Mutual information in nats.
+    """
+    if N is None:
+        raise ValueError("provide dimensionality of neural data X.")
+    if V is not None or W is not None:
+        cross_cov_mats_proj = project_cross_cov_mats(cross_cov_mats, V, W)
+    else:
+        cross_cov_mats_proj = cross_cov_mats
+    if M is None:
+        #         raise ValueError('provide dimensionality of external data U.')
+        M = len(cross_cov_mats_proj[0]) - N
+    cov_2_T_pi = calc_cov_from_cross_cov_mats(cross_cov_mats_proj)
+    PI = sdca_calc_pi_from_cov(cov_2_T_pi, N=N, M=M)
+
+    return PI
+
+
+def sdca_calc_pi_from_cov(cov_2_T_pi, N=None, M=None, return_cov_mats=False):
+    """Calculates the Gaussian Predictive Information between variables X
+    {1,...,T_pi} and U {T_pi+1,...,2*T_pi} with covariance matrix cov_2_T_pi.
+    X is stacked on top of U.
+
+    Parameters
+    ----------
+    cov_2_T_pi : np.ndarray, shape (T_pi, T_pi)
+        Covariance matrix.
+    N : int
+        Dimension of neural data X
+    M : int
+        Dimension of external data U
+
+    Returns
+    -------
+    PI : float
+        Mutual information in nats.
+    """
+    if N is None:
+        raise ValueError("provide dimensionality of neural data X.")
+    if M is None:
+        raise ValueError("provide dimensionality of external data U.")
+
+    T = cov_2_T_pi.shape[0] // (N + M)
+    use_torch = isinstance(cov_2_T_pi, torch.Tensor)
+
+    if use_torch:
+        # slice cov_2_T_pi for X
+        xcov = [
+            torch.stack(
+                [
+                    cov_2_T_pi[
+                        i * (N + M) : i * (N + M) + N, j * (N + M) : j * (N + M) + N
+                    ]
+                    for i in range(T)
+                ]
+            )
+            for j in range(T)
+        ]
+        # slice cov_2_T_pi for U
+        ucov = [
+            torch.stack(
+                [
+                    cov_2_T_pi[
+                        N + i * (N + M) : (i + 1) * (N + M),
+                        N + j * (N + M) : (j + 1) * (N + M),
+                    ]
+                    for i in range(T)
+                ]
+            )
+            for j in range(T)
+        ]
+
+        # concatenate slices to covariance matrices
+        xcov = torch.flatten(torch.cat(xcov, dim=-1), start_dim=0, end_dim=1)
+        ucov = torch.flatten(torch.cat(ucov, dim=-1), start_dim=0, end_dim=1)
+
+        logdet_x = torch.slogdet(xcov)[1]
+        logdet_u = torch.slogdet(ucov)[1]
+        logdet_2T_pi = torch.slogdet(cov_2_T_pi)[1]
+    else:
+        xcov = np.array(
+            [
+                [
+                    cov_2_T_pi[
+                        i * (N + M) : i * (N + M) + N, j * (N + M) : j * (N + M) + N
+                    ]
+                    for i in range(T)
+                ]
+                for j in range(T)
+            ]
+        )
+        ucov = np.array(
+            [
+                [
+                    cov_2_T_pi[
+                        N + i * (N + M) : (i + 1) * (N + M),
+                        N + j * (N + M) : (j + 1) * (N + M),
+                    ]
+                    for i in range(T)
+                ]
+                for j in range(T)
+            ]
+        )
+
+        xcov = np.concatenate(np.concatenate(xcov, axis=-1))
+        ucov = np.concatenate(np.concatenate(ucov, axis=-1))
+
+        logdet_x = np.linalg.slogdet(xcov)[1]
+        logdet_u = np.linalg.slogdet(ucov)[1]
+        logdet_2T_pi = np.linalg.slogdet(cov_2_T_pi)[1]
+    PI = 0.5 * logdet_x + 0.5 * logdet_u - 0.5 * logdet_2T_pi
+
+    if return_cov_mats:
+        return PI, xcov, ucov, cov_2_T_pi
+    else: 
+        return PI
 
 
 class DynamicalComponentsAnalysisFFT(object):

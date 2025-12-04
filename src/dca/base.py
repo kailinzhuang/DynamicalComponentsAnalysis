@@ -196,7 +196,8 @@ class BaseComponentsAnalysis(object):
     """
     def __init__(self, T=None, init="random_ortho", n_init=1, stride=1,
                  chunk_cov_estimate=None, tol=1e-6, verbose=False, device="cpu",
-                 dtype=torch.float64, rng_or_seed=None):
+                 dtype=torch.float64, rng_or_seed=None,
+                 ib_loss=False, ib_beta=None):
         self.T = T
         self.T_fit = None
         self.init = init
@@ -214,6 +215,8 @@ class BaseComponentsAnalysis(object):
         self.dtype = dtype
         self.mean_ = None
         self.rng = check_random_state(rng_or_seed)
+        self.ib_loss=ib_loss
+        self.ib_beta=ib_beta
 
     def estimate_data_statistics(self):
         """Estimate the data statistics needed for projection fitting.
@@ -310,12 +313,15 @@ class SingleProjectionComponentsAnalysis(BaseComponentsAnalysis):
     """
     def __init__(self, d=None, T=None, init="random_ortho", n_init=1, stride=1,
                  chunk_cov_estimate=None, tol=1e-6, verbose=False, device="cpu",
-                 dtype=torch.float64, rng_or_seed=None):
+                 dtype=torch.float64, rng_or_seed=None,
+                 ib_loss=False,
+                 ib_beta=None):
 
         super(SingleProjectionComponentsAnalysis,
               self).__init__(T=T, init=init, n_init=n_init, stride=stride,
                              chunk_cov_estimate=chunk_cov_estimate, tol=tol,
-                             verbose=verbose, device=device, dtype=dtype, rng_or_seed=rng_or_seed)
+                             verbose=verbose, device=device, dtype=dtype, rng_or_seed=rng_or_seed,
+                             ib_loss=ib_loss, ib_beta=ib_beta)
 
         self.d = d
         self.d_fit = None
@@ -342,7 +348,7 @@ class SingleProjectionComponentsAnalysis(BaseComponentsAnalysis):
         for ii in range(n_init):
             start = time.time()
             self._logger.info('Starting projection fig {} of {}.'.format(ii + 1, n_init))
-            coef, score = self._fit_projection(d=d, T=T)
+            coef, score, mi_xp_vxp = self._fit_projection(d=d, T=T)
             delta_time = round((time.time() - start) / 60., 1)
             self._logger.info('Projection fit {} of {} took {:0.1f} minutes.'.format(ii + 1,
                                                                                      n_init,
@@ -351,6 +357,7 @@ class SingleProjectionComponentsAnalysis(BaseComponentsAnalysis):
             coefs.append(coef)
         idx = np.argmax(scores)
         self.coef_ = coefs[idx]
+        self.mi_xp_vxp = mi_xp_vxp
 
     def fit(self, X, d=None, T=None, n_init=None, *args, **kwargs):
         """Estimate the data statistics and fit the projection matrix.
