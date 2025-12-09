@@ -70,7 +70,7 @@ def build_ib_loss(cross_cov_mats, d, ortho_lambda=1., beta=0.5):
                 W=V,
                 N=N,
                 M=d)
-            return -pi + reg_val + beta * mi_xp_vxp
+            return -beta * pi + reg_val +  mi_xp_vxp
 
     return loss
 
